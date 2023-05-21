@@ -13,8 +13,9 @@
 extern ADC_HandleTypeDef hadc1;
 extern DMA_HandleTypeDef hdma_adc1;
 
-extern SPI_HandleTypeDef hspi1;
-extern DMA_HandleTypeDef hdma_spi1_rx;
+extern UART_HandleTypeDef huart1;
+extern DMA_HandleTypeDef hdma_usart1_rx;
+extern DMA_HandleTypeDef hdma_usart1_tx;
 
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
@@ -24,11 +25,11 @@ extern TIM_HandleTypeDef htim5;
 extern void init_icg_sh();
 extern void init_adc_tim();
 
-#define CCDBuffer 3694
-volatile uint16_t CCDPixelBuffer[CCDBuffer];
-
-#define SPIRxBufferSize CCDBuffer * 2
-uint8_t SPIRxBuffer[SPIRxBufferSize] = { 0 };
+#define CCDBufSz 3694
+#define CommTxBufSz CCDBufSz * 2 + sizeof(CCDCmd_t)
+#define CommRxBufSz 16
+uint8_t CommRxBuf[CommRxBufSz] = { 0 };
+uint8_t CommTxBuf[CommTxBufSz] = { 0 };
 
 int curr_reading = 0;
 int flushed = 0;
@@ -38,6 +39,7 @@ CCDConfig_t ccd_config;
 void tcd1304_flush();
 void tcd1304_config_icg_sh();
 void tcd1304_stop_timers();
+void tcd1304_transmit_cmd(CCDCmd_t *cmd);
 
 void tcd1304_set_config(CCDConfig_t *cfg) {
 	tcd1304_flush();
@@ -55,8 +57,7 @@ void tcd1304_setup() {
 	ccd_config.icg_period = 630000;
 
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); //PA6 - fM
-
-	HAL_SPI_Receive_DMA(&hspi1, SPIRxBuffer, SPIRxBufferSize);
+	HAL_UART_Receive_DMA(&huart1, CommRxBuf, CommRxBufSz);
 }
 
 void tcd1304_loop() {
@@ -97,6 +98,11 @@ void tcd1304_stop_timers() {
 	HAL_TIM_Base_Stop(&htim5);
 }
 
+void tcd1304_transmit_cmd(CCDCmd_t *cmd) {
+	HAL_UART_Transmit_DMA(&huart1, (uint8_t*) cmd, cmd->len + sizeof(CCDCmd_t));
+	HAL_UART_Receive_DMA(&huart1, CommRxBuf, CommRxBufSz);
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 	if (htim != &htim2)
 		return;
@@ -106,22 +112,52 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
 	if (curr_reading == 6) {
 		init_adc_tim();
-		HAL_ADC_Start_DMA(&hadc1, (uint32_t*) CCDPixelBuffer, CCDBuffer);
+		HAL_ADC_Start_DMA(&hadc1, (uint32_t*) (CommTxBuf + sizeof(CCDCmd_t)),
+				CCDBufSz);
 		HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4); //ADC
 	}
 
 	curr_reading++;
 }
 
-void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
-	HAL_SPI_Receive_DMA(hspi, SPIRxBuffer, SPIRxBufferSize);
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart != &huart1)
+		return;
 
-	uint8_t *buf = SPIRxBuffer;
+	memset(CommTxBuf, 0, CommTxBufSz);
 
-	while (!*(uint16_t*) (buf++) == 0x1304)
-		;
+	CCDCmd_t *response = (CCDCmd_t*) CommTxBuf;
+	CCDCmd_t *cmd = (CCDCmd_t*) CommRxBuf;
+	int idx = 0;
 
-	update_config = (CCDConfig_t*) (SPIRxBuffer + 2);
+	response->magic = MAGIC;
+	response->type = cmd->type;
+
+	while (idx++ < CommRxBufSz - 2 && cmd->magic != MAGIC)
+		((uint8_t*) cmd++);
+
+	if (idx >= CommRxBufSz - 2) {
+		cmd = (CCDCmd_t*) CommRxBuf;
+		cmd->type = -1;
+	}
+
+	switch (cmd->type) {
+	case CCDMSG_CFG:
+		update_config = (CCDConfig_t*) cmd->data;
+		memcpy(response->data, "kk eae men", 10);
+		response->len = 10;
+		break;
+	default:
+		response->type = -1;
+		memcpy(response->data, "error :(", 8);
+		response->len = 8;
+		break;
+	}
+
+	// HAL_SPI_Transmit_DMA(&hspi1, SPITxBuffer, SPIRxBufferSize);
+	tcd1304_transmit_cmd(response);
+
+	__asm__("nop");
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
@@ -133,7 +169,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 //	if (!received)
 //		return;
 //
-	HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*) CCDPixelBuffer, CCDBuffer * 2);
+	CCDCmd_t *cmd = (CCDCmd_t*) CommTxBuf;
+	cmd->magic = MAGIC;
+	cmd->type = CCDMSG_READ;
+	cmd->len = CCDBufSz * 2;
+
+	tcd1304_stop_timers();
+	tcd1304_transmit_cmd(cmd);
 }
 
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc) {
