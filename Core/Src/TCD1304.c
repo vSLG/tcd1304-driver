@@ -26,10 +26,11 @@ extern void init_icg_sh();
 extern void init_adc_tim();
 
 #define CCDBufSz 3694
-#define CommTxBufSz CCDBufSz * 2 + sizeof(CCDCmd_t)
+#define CommTxBufSz sizeof(CCDCmd_t) + CCDBufSz * 2
 #define CommRxBufSz 16
 uint8_t CommRxBuf[CommRxBufSz] = { 0 };
 uint8_t CommTxBuf[CommTxBufSz] = { 0 };
+uint16_t CCDBuf[CCDBufSz] = { 0 };
 
 int curr_reading = 0;
 int flushed = 0;
@@ -57,7 +58,9 @@ void tcd1304_setup() {
 	ccd_config.icg_period = 630000;
 
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); //PA6 - fM
+	HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4); //ADC
 	HAL_UART_Receive_DMA(&huart1, CommRxBuf, CommRxBufSz);
+	HAL_TIM_Base_Start_IT(&htim2);
 }
 
 void tcd1304_loop() {
@@ -87,15 +90,13 @@ void tcd1304_config_icg_sh() {
 	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); //PA0 - ICG
 	__HAL_TIM_SET_COUNTER(&htim2, 66); //600 ns delay
 	HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3); //PA2 - SH
-	HAL_TIM_Base_Start_IT(&htim2);
+	__HAL_TIM_SET_COUNTER(&htim5, 0); //600 ns delay
 }
 
 void tcd1304_stop_timers() {
 	HAL_ADC_Stop_DMA(&hadc1);
-	HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4); //ADC
-	HAL_TIM_Base_Stop(&htim2);
-	HAL_TIM_Base_Stop(&htim4);
-	HAL_TIM_Base_Stop(&htim5);
+	HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+	HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_3);
 }
 
 void tcd1304_transmit_cmd(CCDCmd_t *cmd) {
@@ -110,11 +111,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 	if (curr_reading == 3)
 		flushed = 1;
 
-	if (curr_reading == 6) {
-		init_adc_tim();
-		HAL_ADC_Start_DMA(&hadc1, (uint32_t*) (CommTxBuf + sizeof(CCDCmd_t)),
-				CCDBufSz);
-		HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4); //ADC
+	if (curr_reading >= 6) {
+		HAL_ADC_Start_DMA(&hadc1, (uint32_t*) CCDBuf, CCDBufSz);
 	}
 
 	curr_reading++;
@@ -161,6 +159,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+	if (hadc != &hadc1)
+		return;
+
+	HAL_ADC_Stop_DMA(&hadc1);
+
 	// __asm__("nop");
 	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
 	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
@@ -173,8 +176,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	cmd->magic = MAGIC;
 	cmd->type = CCDMSG_READ;
 	cmd->len = CCDBufSz * 2;
+	memcpy(cmd->data, CCDBuf, CCDBufSz * 2);
 
-	tcd1304_stop_timers();
+	// tcd1304_stop_timers();
+
 	tcd1304_transmit_cmd(cmd);
 }
 
